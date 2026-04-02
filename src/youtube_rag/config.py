@@ -13,9 +13,9 @@ WHISPER_MODEL = "CWTchen/Belle-whisper-large-v3-zh-punct-ct2-float32"
 LOCAL_EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
 
 # LLM settings
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").lower()  # openai | ollama
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").lower()  # openai | ollama
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.4-mini")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
 
 # 1. Get the absolute path of the folder containing this file
 BASE_DIR = Path(__file__).resolve().parent.parent.parent

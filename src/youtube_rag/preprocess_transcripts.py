@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import gc
+import difflib
 import json
 import logging
 import os
@@ -9,81 +9,59 @@ from pathlib import Path
 from typing import Any
 from urllib import error, request
 
-try:
-    from dotenv import load_dotenv
-except ImportError:  # pragma: no cover - optional dependency
-    load_dotenv = None
+from dotenv import load_dotenv
 
 from . import config
 
-SYSTEM_PROMPT = (
-    "You are an expert Chinese political and historical analyst. I will provide you with an "
-    "AI-generated transcript from a YouTube video.\n"
-    "Your tasks:\n"
-    "- Clean up errors: Silently correct obvious phonetic/homophone mistakes (e.g., incorrectly "
-    "transcribed names of historical figures or political terms).\n"
-    "- Summarize: Provide a comprehensive summary of the video's main arguments and narrative.\n"
-    "- Extract Entities: List the key people, organizations, and historical events mentioned.\n"
-    "- Formatting: Output your response in clean Markdown format with headings for 'Summary', "
-    "'Key Entities', and 'Core Arguments'. Do not include any conversational filler."
-)
-
 CLEAN_TEXT_SYSTEM_PROMPT = (
-    "You are a careful Chinese transcript editor. Correct obvious homophone/ASR errors while "
-    "preserving the original meaning and order. Output only the cleaned transcript text with no "
-    "headings, markdown, or commentary. For instance, '楚军' should be '储君', and '古墓' should be "
-    "the political figure '谷牧'."
+    "You are a specialized linguistic corrector for high-level Chinese political and historical audio transcripts. "
+    "The input is a raw Whisper ASR transcript. Your task is to fix phonetic/homophone errors (同音字) "
+    "while maintaining the exact original narrative structure.\n\n"
+    
+    "CORE RULES:\n"
+    "1. VIDEO TITLE AS SOURCE OF TRUTH: I will provide the video title in the user prompt. "
+    "The names and terms in the title are 100% correct. If the transcript contains phonetic variations "
+    "of names found in the title, you MUST correct them to match the title's spelling exactly.\n"
+    "2. POLITICAL ENTITIES: Prioritize historical figures and political terms. "
+    "Examples: '博呱呱' -> '薄瓜瓜', '李旺之' -> '李望知', '古墓' -> '谷牧', '古开来' -> '谷开来'.\n"
+    "3. NO SUMMARIZATION: Do not shorten the text or 'clean up' the grammar. Keep it raw but correctly spelled.\n"
+    "4. NO MARKDOWN: Return ONLY the raw cleaned Chinese string. No code blocks, no intro text.\n"
+    "5. ALIGNMENT: Keep the character count within 2% of the input to ensure timestamp alignment."
 )
 
+DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
 
-class LLMClient:
-    def __init__(self, provider: str, openai_model: str, ollama_model: str) -> None:
-        self.provider = provider
-        self.openai_model = openai_model
-        self.ollama_model = ollama_model
 
-    def chat(self, system_prompt: str, user_prompt: str) -> str:
-        if self.provider == "openai":
-            return self._chat_openai(system_prompt, user_prompt)
-        if self.provider == "ollama":
-            return self._chat_ollama(system_prompt, user_prompt)
-        raise ValueError(f"Unsupported LLM_PROVIDER: {self.provider}")
+class OpenAIClient:
+    def __init__(self, model: str) -> None:
+        self.model = model
 
-    def _chat_openai(self, system_prompt: str, user_prompt: str) -> str:
+    def clean_text(self, original_full_text: str, video_title: str) -> str:
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
-            raise RuntimeError("OPENAI_API_KEY is required when LLM_PROVIDER=openai")
+            raise RuntimeError("OPENAI_API_KEY is required. Please set it in .env")
 
         base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
         url = f"{base_url.rstrip('/')}/chat/completions"
+
         payload = {
-            "model": self.openai_model,
-            "temperature": 0.2,
+            "model": self.model,
+            "temperature": 0,
             "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {"role": "system", "content": CLEAN_TEXT_SYSTEM_PROMPT},
+                {
+                "role": "user", 
+                "content": f"VIDEO TITLE: {video_title}\n\nTRANSCRIPT TO CLEAN:\n{original_full_text}"
+            },
             ],
         }
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
+
         data = _post_json(url=url, payload=payload, headers=headers)
         return data["choices"][0]["message"]["content"].strip()
-
-    def _chat_ollama(self, system_prompt: str, user_prompt: str) -> str:
-        base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        url = f"{base_url.rstrip('/')}/api/chat"
-        payload = {
-            "model": self.ollama_model,
-            "stream": False,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        }
-        data = _post_json(url=url, payload=payload, headers={"Content-Type": "application/json"})
-        return data["message"]["content"].strip()
 
 
 def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
@@ -103,102 +81,131 @@ def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str]) -> di
         raise RuntimeError(f"Connection error for {url}: {exc}") from exc
 
 
-def build_summary_user_prompt(title: str, youtube_url: str | None, full_text: str) -> str:
-    return (
-        f"Video title: {title}\n"
-        f"YouTube URL: {youtube_url or 'N/A'}\n"
-        "\n"
-        "Transcript:\n"
-        f"{full_text}"
-    )
-
-
-def build_clean_text_user_prompt(title: str, full_text: str) -> str:
-    return (
-        f"Video title: {title}\n"
-        "\n"
-        "Please return the corrected transcript text only:\n"
-        f"{full_text}"
-    )
-
-
 def load_transcript(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
 
     segments = data.get("segments") or []
-    full_text = data.get("full_text")
-    if not full_text:
-        # Chinese handling: never insert spaces when stitching chunks
-        full_text = "".join(str(seg.get("text", "")) for seg in segments)
+
+    original_full_text = data.get("full_text")
 
     return {
         "video_id": data.get("video_id") or path.stem,
         "title": data.get("title") or path.stem,
-        "full_text": full_text,
-        "segments": segments,
         "youtube_url": data.get("youtube_url"),
+        "segments": segments,
+        "original_full_text": original_full_text,
     }
 
 
-def cleanup_local_gpu_cache() -> None:
-    gc.collect()
-    try:
-        import torch
+def align_segments(original_segments: list[dict[str, Any]], cleaned_full_text: str) -> list[dict[str, Any]]:
+    original_full_text = "".join(str(seg.get("text", "")) for seg in original_segments)
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:
-        pass
+    boundaries = [0]
+    for seg in original_segments:
+        boundaries.append(boundaries[-1] + len(str(seg.get("text", ""))))
+
+    mapped_boundaries = _map_boundaries_with_difflib(
+        original_text=original_full_text,
+        cleaned_text=cleaned_full_text,
+        boundaries=boundaries,
+    )
+
+    cleaned_segments: list[dict[str, Any]] = []
+    for i, seg in enumerate(original_segments):
+        start_j = mapped_boundaries[i]
+        end_j = mapped_boundaries[i + 1]
+        if end_j < start_j:
+            end_j = start_j
+
+        updated = dict(seg)
+        updated["text"] = cleaned_full_text[start_j:end_j]
+        cleaned_segments.append(updated)
+
+    return cleaned_segments
 
 
-def process_one_file(transcript_path: Path, output_dir: Path, llm_client: LLMClient, force: bool) -> bool:
+def _map_boundaries_with_difflib(original_text: str, cleaned_text: str, boundaries: list[int]) -> list[int]:
+    matcher = difflib.SequenceMatcher(a=original_text, b=cleaned_text, autojunk=False)
+    opcodes = matcher.get_opcodes()
+
+    mapped: list[int] = []
+    op_idx = 0
+
+    for boundary in boundaries:
+        while op_idx < len(opcodes) - 1 and boundary > opcodes[op_idx][2]:
+            op_idx += 1
+
+        tag, i1, i2, j1, j2 = opcodes[op_idx]
+
+        if tag == "equal":
+            mapped_index = j1 + (boundary - i1)
+        elif tag == "replace":
+            span_i = max(i2 - i1, 1)
+            span_j = j2 - j1
+            ratio = (boundary - i1) / span_i
+            mapped_index = j1 + int(round(ratio * span_j))
+        elif tag == "delete":
+            mapped_index = j1
+        else:  # insert
+            mapped_index = j2 if boundary >= i1 else j1
+
+        mapped_index = max(0, min(len(cleaned_text), mapped_index))
+        if mapped and mapped_index < mapped[-1]:
+            mapped_index = mapped[-1]
+        mapped.append(mapped_index)
+
+    return mapped
+
+
+def process_one_file(transcript_path: Path, output_dir: Path, client: OpenAIClient, force: bool) -> bool:
     payload = load_transcript(transcript_path)
     video_id = str(payload["video_id"])
-    summary_path = output_dir / f"{video_id}.summary.md"
+    video_title = payload.get("title", "Unknown Title")
     cleaned_path = output_dir / f"{video_id}.cleaned.json"
 
-    if not force and summary_path.exists() and cleaned_path.exists():
-        logging.info("[SKIP] %s already processed", video_id)
+    if not force and cleaned_path.exists():
+        logging.info("[SKIP] %s already cleaned", video_id)
         return True
 
-    try:
-        summary_markdown = llm_client.chat(
-            system_prompt=SYSTEM_PROMPT,
-            user_prompt=build_summary_user_prompt(
-                title=str(payload["title"]),
-                youtube_url=payload.get("youtube_url"),
-                full_text=str(payload["full_text"]),
-            ),
-        )
-        cleaned_full_text = llm_client.chat(
-            system_prompt=CLEAN_TEXT_SYSTEM_PROMPT,
-            user_prompt=build_clean_text_user_prompt(
-                title=str(payload["title"]),
-                full_text=str(payload["full_text"]),
-            ),
-        )
+    original_segments = payload["segments"]
+    original_full_text = str(payload["original_full_text"])
 
-        summary_path.write_text(summary_markdown, encoding="utf-8")
+    try:
+        cleaned_full_text = client.clean_text(original_full_text, video_title)
+
+        length_ratio = len(cleaned_full_text) / max(len(original_full_text), 1)
+        if abs(length_ratio - 1.0) > 0.10:
+            logging.warning(
+                "[WARN] %s cleaned length changed too much (orig=%s, cleaned=%s). Using original text for safety.",
+                video_id,
+                len(original_full_text),
+                len(cleaned_full_text),
+            )
+            cleaned_full_text = original_full_text
+            cleaned_segments = [dict(seg) for seg in original_segments]
+        else:
+            cleaned_segments = align_segments(
+                original_segments=original_segments,
+                cleaned_full_text=cleaned_full_text,
+            )
+
         cleaned_payload = {
             "video_id": video_id,
             "title": payload["title"],
             "youtube_url": payload.get("youtube_url"),
             "cleaned_full_text": cleaned_full_text,
-            "segments": payload["segments"],
-            "summary_markdown_path": str(summary_path),
+            "segments": cleaned_segments,
         }
+
         with cleaned_path.open("w", encoding="utf-8") as f:
             json.dump(cleaned_payload, f, ensure_ascii=False, indent=2)
 
-        logging.info("[OK] %s -> %s, %s", video_id, summary_path.name, cleaned_path.name)
+        logging.info("[OK] %s -> %s", video_id, cleaned_path.name)
         return True
     except Exception as exc:
         logging.exception("[FAIL] %s (%s)", video_id, exc)
         return False
-    finally:
-        if llm_client.provider == "ollama":
-            cleanup_local_gpu_cache()
 
 
 def collect_input_files(transcripts_dir: Path, video_id: str | None) -> list[Path]:
@@ -214,7 +221,7 @@ def collect_input_files(transcripts_dir: Path, video_id: str | None) -> list[Pat
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Preprocess transcript JSON files with LLM cleaning and summarization")
+    parser = argparse.ArgumentParser(description="Clean transcript JSON files with OpenAI + difflib alignment")
     parser.add_argument("--limit", type=int, default=None, help="Process at most N transcript files")
     parser.add_argument("--video-id", type=str, default=None, help="Process only one video_id")
     parser.add_argument("--force", action="store_true", help="Reprocess even if outputs already exist")
@@ -222,8 +229,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    if load_dotenv is not None:
-        load_dotenv(config.ENV_FILE)
+    load_dotenv(config.ENV_FILE)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -231,6 +237,7 @@ def main() -> None:
     output_dir = Path(config.PROCESSED_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    args = parse_args()
     files = collect_input_files(transcripts_dir=transcripts_dir, video_id=args.video_id)
     if args.limit is not None:
         files = files[: args.limit]
@@ -239,19 +246,17 @@ def main() -> None:
         logging.info("No transcript files found to process in %s", transcripts_dir)
         return
 
-    llm_client = LLMClient(
-        provider=config.LLM_PROVIDER,
-        openai_model=config.OPENAI_MODEL,
-        ollama_model=config.OLLAMA_MODEL,
-    )
+    model = os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
+    client = OpenAIClient(model=model)
 
     success_count = 0
     fail_count = 0
+
     for file_path in files:
         ok = process_one_file(
             transcript_path=file_path,
             output_dir=output_dir,
-            llm_client=llm_client,
+            client=client,
             force=args.force,
         )
         if ok:
@@ -263,5 +268,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    args = parse_args()
     main()
