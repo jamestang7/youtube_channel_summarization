@@ -1,0 +1,50 @@
+# General Python ignores
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.pyo
+*.pyd
+*.pdb
+
+# Environments
+.env
+.venv/
+venv/
+ENV/
+env/
+.idea/
+.vscode/
+.mypy_cache/
+.pytest_cache/
+coverage.*
+htmlcov/
+.cache/
+.tox/
+
+# Jupyter Notebooks checkpoints
+.ipynb_checkpoints/
+
+# Project-specific: omit all of data/ and notebooks/
+data/
+notebooks/
+ffmpeg-2026-03-26-git-fd9f1e9c52-essentials_build/
+.cursorrules
+
+# SQLite DBs and misc
+*.db
+*.sqlite3
+*.sqlite
+
+# OS-specific garbage
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+cookies.firefox-private.txt
+

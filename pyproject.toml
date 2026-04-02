@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "youtube-channel-summarization"
+version = "0.1.0"
+description = "A local RAG system for YouTube transcripts"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "yt-dlp>=2026.03.17",
+    "faster-whisper>=1.1.0",
+    "chromadb>=0.5.23",
+    "langchain>=0.3.14",
+    "langchain-text-splitters>=0.3.4",
+    "langchain-community>=0.3.14",
+    "sentence-transformers>=3.3.1",
+    "pydantic>=2.10.0",
+    "static-ffmpeg>=3.0",
+    "bgutil-ytdlp-pot-provider>=1.3.1",
+    "ipykernel>=7.2.0",
+    "torch==2.6.0+cu124",
+    "torchaudio==2.6.0+cu124",
+    "torchvision==0.21.0+cu124",
+    "nvidia-cublas-cu12>=12.4.5.8",
+    "nvidia-cudnn-cu12>=9.1.0.70",
+    "duckdb>=1.5.1",
+    "yt-dlp-ejs==0.8.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[project.scripts]
+youtube-rag = "youtube_rag.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/youtube_rag", "src/ytb_channel_bot"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+# Add this section at the bottom so uv knows where the GPU versions live
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
+torchaudio = { index = "pytorch-cu124" }

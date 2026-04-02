@@ -1,0 +1,13 @@
+# Production pins for the YouTube RAG pipeline (pip install -r requirements.txt).
+# GPU: install PyTorch with CUDA separately from https://pytorch.org/get-started/locally/
+# Example (CUDA 12.4): pip install torch --index-url https://download.pytorch.org/whl/cu124
+
+yt-dlp==2025.1.26
+faster-whisper==1.1.0
+chromadb==0.5.23
+langchain==0.3.14
+langchain-text-splitters==0.3.5
+langchain-community==0.3.14
+sentence-transformers==3.3.1
+pydantic==2.10.4
+static-ffmpeg>=3.0
