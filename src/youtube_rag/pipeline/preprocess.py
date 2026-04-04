@@ -4,20 +4,25 @@ import argparse
 import difflib
 import json
 import logging
-import os
+import time
 from pathlib import Path
-from typing import Any
-from urllib import error, request
+from typing import Any, Iterator, TypeVar
 
-from dotenv import load_dotenv
+from ..core import config
+from ..core.models import TranscriptSegment
+from ..rag.llm_client import LLMChatClient
 
-from . import config
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover - optional dependency
+    tqdm = None
+
+T = TypeVar("T")
 
 CLEAN_TEXT_SYSTEM_PROMPT = (
     "You are a specialized linguistic corrector for high-level Chinese political and historical audio transcripts. "
     "The input is a raw Whisper ASR transcript. Your task is to fix phonetic/homophone errors (同音字) "
     "while maintaining the exact original narrative structure.\n\n"
-    
     "CORE RULES:\n"
     "1. VIDEO TITLE AS SOURCE OF TRUTH: I will provide the video title in the user prompt. "
     "The names and terms in the title are 100% correct. If the transcript contains phonetic variations "
@@ -29,56 +34,47 @@ CLEAN_TEXT_SYSTEM_PROMPT = (
     "5. ALIGNMENT: Keep the character count within 2% of the input to ensure timestamp alignment."
 )
 
-DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
 
+class TranscriptCleanerClient:
+    def __init__(self, provider: str) -> None:
+        if provider not in {config.PROVIDER_OPENAI, config.PROVIDER_GROQ}:
+            raise RuntimeError(f"Unsupported cleaner provider: {provider}")
+        self.provider = provider
+        self.chat_client = LLMChatClient(provider=provider)
 
-class OpenAIClient:
-    def __init__(self, model: str) -> None:
-        self.model = model
+    def active_model(self) -> str:
+        return self.chat_client.active_model()
 
     def clean_text(self, original_full_text: str, video_title: str) -> str:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY is required. Please set it in .env")
+        max_chars = 15000 if self.provider == config.PROVIDER_OPENAI else 1500
+        parts = self._split_text_by_char_budget(original_full_text, max_chars=max_chars)
 
-        base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-        url = f"{base_url.rstrip('/')}/chat/completions"
+        cleaned_parts: list[str] = []
+        for part in parts:
+            user_prompt = f"VIDEO TITLE: {video_title}\n\nTRANSCRIPT TO CLEAN:\n{part}"
+            cleaned_parts.append(
+                self.chat_client.generate(
+                    system_prompt=CLEAN_TEXT_SYSTEM_PROMPT,
+                    user_prompt=user_prompt,
+                    temperature=0,
+                )
+            )
+            if self.provider == config.PROVIDER_GROQ and len(parts) > 1:
+                time.sleep(5)
 
-        payload = {
-            "model": self.model,
-            "temperature": 0,
-            "messages": [
-                {"role": "system", "content": CLEAN_TEXT_SYSTEM_PROMPT},
-                {
-                "role": "user", 
-                "content": f"VIDEO TITLE: {video_title}\n\nTRANSCRIPT TO CLEAN:\n{original_full_text}"
-            },
-            ],
-        }
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
+        return "".join(cleaned_parts)
 
-        data = _post_json(url=url, payload=payload, headers=headers)
-        return data["choices"][0]["message"]["content"].strip()
-
-
-def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
-    req = request.Request(
-        url=url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers=headers,
-        method="POST",
-    )
-    try:
-        with request.urlopen(req, timeout=300) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP error {exc.code} for {url}: {body}") from exc
-    except error.URLError as exc:
-        raise RuntimeError(f"Connection error for {url}: {exc}") from exc
+    @staticmethod
+    def _split_text_by_char_budget(full_text: str, max_chars: int) -> list[str]:
+        if len(full_text) <= max_chars:
+            return [full_text]
+        parts: list[str] = []
+        start = 0
+        while start < len(full_text):
+            end = min(start + max_chars, len(full_text))
+            parts.append(full_text[start:end])
+            start = end
+        return parts
 
 
 def load_transcript(path: Path) -> dict[str, Any]:
@@ -86,24 +82,29 @@ def load_transcript(path: Path) -> dict[str, Any]:
         data = json.load(f)
 
     segments = data.get("segments") or []
-
-    original_full_text = data.get("full_text")
-
     return {
         "video_id": data.get("video_id") or path.stem,
         "title": data.get("title") or path.stem,
         "youtube_url": data.get("youtube_url"),
         "segments": segments,
-        "original_full_text": original_full_text,
+        "original_full_text": data.get("full_text"),
     }
 
 
 def align_segments(original_segments: list[dict[str, Any]], cleaned_full_text: str) -> list[dict[str, Any]]:
-    original_full_text = "".join(str(seg.get("text", "")) for seg in original_segments)
+    typed_segments = [
+        TranscriptSegment(
+            start=float(seg.get("start", 0.0)),
+            end=float(seg.get("end", 0.0)),
+            text=str(seg.get("text", "")),
+        )
+        for seg in original_segments
+    ]
+    original_full_text = "".join(seg.text for seg in typed_segments)
 
     boundaries = [0]
-    for seg in original_segments:
-        boundaries.append(boundaries[-1] + len(str(seg.get("text", ""))))
+    for seg in typed_segments:
+        boundaries.append(boundaries[-1] + len(seg.text))
 
     mapped_boundaries = _map_boundaries_with_difflib(
         original_text=original_full_text,
@@ -158,7 +159,7 @@ def _map_boundaries_with_difflib(original_text: str, cleaned_text: str, boundari
     return mapped
 
 
-def process_one_file(transcript_path: Path, output_dir: Path, client: OpenAIClient, force: bool) -> bool:
+def process_one_file(transcript_path: Path, output_dir: Path, client: TranscriptCleanerClient, force: bool) -> bool:
     payload = load_transcript(transcript_path)
     video_id = str(payload["video_id"])
     video_title = payload.get("title", "Unknown Title")
@@ -173,39 +174,34 @@ def process_one_file(transcript_path: Path, output_dir: Path, client: OpenAIClie
 
     try:
         cleaned_full_text = client.clean_text(original_full_text, video_title)
-
-        length_ratio = len(cleaned_full_text) / max(len(original_full_text), 1)
-        if abs(length_ratio - 1.0) > 0.10:
-            logging.warning(
-                "[WARN] %s cleaned length changed too much (orig=%s, cleaned=%s). Using original text for safety.",
-                video_id,
-                len(original_full_text),
-                len(cleaned_full_text),
-            )
-            cleaned_full_text = original_full_text
-            cleaned_segments = [dict(seg) for seg in original_segments]
-        else:
-            cleaned_segments = align_segments(
-                original_segments=original_segments,
-                cleaned_full_text=cleaned_full_text,
-            )
-
-        cleaned_payload = {
-            "video_id": video_id,
-            "title": payload["title"],
-            "youtube_url": payload.get("youtube_url"),
-            "cleaned_full_text": cleaned_full_text,
-            "segments": cleaned_segments,
-        }
-
-        with cleaned_path.open("w", encoding="utf-8") as f:
-            json.dump(cleaned_payload, f, ensure_ascii=False, indent=2)
-
-        logging.info("[OK] %s -> %s", video_id, cleaned_path.name)
-        return True
+    except TimeoutError:
+        total = len(original_full_text)
+        mid = total // 2
+        cleaned_full_text = client.clean_text(original_full_text[:mid], video_title) + client.clean_text(
+            original_full_text[mid:], video_title
+        )
     except Exception as exc:
         logging.exception("[FAIL] %s (%s)", video_id, exc)
         return False
+
+    cleaned_segments = align_segments(
+        original_segments=original_segments,
+        cleaned_full_text=cleaned_full_text,
+    )
+
+    cleaned_payload = {
+        "video_id": video_id,
+        "title": payload["title"],
+        "youtube_url": payload.get("youtube_url"),
+        "cleaned_full_text": cleaned_full_text,
+        "segments": cleaned_segments,
+    }
+
+    with cleaned_path.open("w", encoding="utf-8") as f:
+        json.dump(cleaned_payload, f, ensure_ascii=False, indent=2)
+
+    logging.info("[OK] %s -> %s", video_id, cleaned_path.name)
+    return True
 
 
 def collect_input_files(transcripts_dir: Path, video_id: str | None) -> list[Path]:
@@ -220,8 +216,18 @@ def collect_input_files(transcripts_dir: Path, video_id: str | None) -> list[Pat
     return sorted(transcripts_dir.glob("*.json"))
 
 
+def iter_with_progress(items: list[T], desc: str) -> Iterator[T]:
+    if tqdm is not None:
+        yield from tqdm(items, desc=desc, unit="file")
+        return
+    total = len(items)
+    for idx, item in enumerate(items, start=1):
+        logging.info("%s [%d/%d]", desc, idx, total)
+        yield item
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Clean transcript JSON files with OpenAI + difflib alignment")
+    parser = argparse.ArgumentParser(description="Clean transcript JSON files with LLM + difflib alignment")
     parser.add_argument("--limit", type=int, default=None, help="Process at most N transcript files")
     parser.add_argument("--video-id", type=str, default=None, help="Process only one video_id")
     parser.add_argument("--force", action="store_true", help="Reprocess even if outputs already exist")
@@ -229,8 +235,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    load_dotenv(config.ENV_FILE)
-
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
     transcripts_dir = Path(config.TRANSCRIPTS_DIR)
@@ -246,13 +250,14 @@ def main() -> None:
         logging.info("No transcript files found to process in %s", transcripts_dir)
         return
 
-    model = os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
-    client = OpenAIClient(model=model)
+    provider = config.LLM_CLEANER.lower()
+    client = TranscriptCleanerClient(provider=provider)
+    logging.info("Cleaning provider=%s model=%s", provider, client.active_model())
 
     success_count = 0
     fail_count = 0
 
-    for file_path in files:
+    for file_path in iter_with_progress(files, desc="Preprocessing"):
         ok = process_one_file(
             transcript_path=file_path,
             output_dir=output_dir,

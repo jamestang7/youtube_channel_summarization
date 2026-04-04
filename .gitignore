@@ -1,50 +1,121 @@
-# General Python ignores
+# -----------------------------
+# OS / editor
+# -----------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Cursor / local rules
+.cursorrules
+
+# -----------------------------
+# Python
+# -----------------------------
 __pycache__/
 *.py[cod]
+*.pyo
+*.pyd
 *.so
 *.egg
 *.egg-info/
-dist/
-build/
 .eggs/
-*.pyo
-*.pyd
-*.pdb
+build/
+dist/
+htmlcov/
+.coverage
+.coverage.*
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.cache/
 
-# Environments
-.env
+# Virtual environments
 .venv/
 venv/
-ENV/
 env/
-.idea/
-.vscode/
-.mypy_cache/
-.pytest_cache/
-coverage.*
-htmlcov/
-.cache/
-.tox/
+ENV/
 
-# Jupyter Notebooks checkpoints
+# -----------------------------
+# Environment / secrets
+# -----------------------------
+.env
+.env.*
+!.env.example
+
+# -----------------------------
+# Jupyter
+# -----------------------------
 .ipynb_checkpoints/
-
-# Project-specific: omit all of data/ and notebooks/
-data/
 notebooks/
-ffmpeg-2026-03-26-git-fd9f1e9c52-essentials_build/
-.cursorrules
 
-# SQLite DBs and misc
-*.db
-*.sqlite3
-*.sqlite
-
-# OS-specific garbage
-.DS_Store
-Thumbs.db
-
+# -----------------------------
 # Logs
+# -----------------------------
 *.log
+
+# -----------------------------
+# Local databases / caches
+# -----------------------------
+*.db
+*.sqlite
+*.sqlite3
+chroma/
+chroma_db/
+vector_db/
+tmp/
+temp/
+
+# -----------------------------
+# Project data outputs
+# Keep raw/generated local data out of git
+# -----------------------------
+data/transcripts/
+data/processed/
+data/raw/
+data/cache/
+data/audio
+data/web_events.jsonl
+
+# If you want to keep the folder structure in git, add empty .gitkeep files
+# and uncomment these lines:
+#!data/transcripts/.gitkeep
+#!data/processed/.gitkeep
+#!data/raw/.gitkeep
+#!data/cache/.gitkeep
+
+# -----------------------------
+# Downloaded / external tools
+# -----------------------------
+ffmpeg-*/
 cookies.firefox-private.txt
 
+# -----------------------------
+# Next.js / frontend
+# -----------------------------
+web/node_modules/
+web/.next/
+web/out/
+web/.vercel/
+web/*.tsbuildinfo
+
+# Optional local frontend env files
+web/.env.local
+web/.env.development.local
+web/.env.test.local
+web/.env.production.local
+
+# -----------------------------
+# Misc package manager caches
+# -----------------------------
+node_modules/
+.npm/
+.pnpm-store/
+
+# -----------------------------
+# Keep source tracked
+# -----------------------------
+!src/
+!web/
+!tests/
