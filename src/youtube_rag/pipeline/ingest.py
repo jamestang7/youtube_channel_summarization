@@ -10,29 +10,13 @@ import random
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Iterator, TypeVar
+from typing import Any
 
 import yt_dlp
 
 from ..core import config
-from ..core.database import get_connection, init_db, video_exists
-
-try:
-    from tqdm import tqdm
-except Exception:  # pragma: no cover - optional dependency
-    tqdm = None
-
-T = TypeVar("T")
-
-
-def iter_with_progress(items: list[T], desc: str) -> Iterator[T]:
-    if tqdm is not None:
-        yield from tqdm(items, desc=desc, unit="video")
-        return
-    total = len(items)
-    for idx, item in enumerate(items, start=1):
-        print(f"{desc} [{idx}/{total}]")
-        yield item
+from ..core.database import get_connection, init_db
+from ..core.utils import iter_with_progress
 
 
 def add_video_to_registry(
@@ -46,20 +30,47 @@ def add_video_to_registry(
     vid = str(video_data["id"])
     title = str(video_data.get("title", "Unknown title"))
     ch = video_data.get("channel_name")
-    mp3 = str(video_data["local_path"]) if not error_message else None
-    status = config.DOWNLOAD_STATUS_ERROR if error_message else config.DOWNLOAD_STATUS_DOWNLOADED
+    mp3 = str(video_data["local_path"]) if not error_message and video_data.get("local_path") else None
     err_log = error_message.strip() if error_message else None
+    upload_date = str(video_data["upload_date"]) if video_data.get("upload_date") is not None else None
+    duration_string = (
+        str(video_data["duration_string"]) if video_data.get("duration_string") is not None else None
+    )
+    media_type = str(video_data["media_type"]) if video_data.get("media_type") is not None else None
+    pipeline_stage = "error" if error_message else "downloaded"
 
     c.execute(
         """
-        INSERT INTO videos (channel_name, video_id, title, mp3_path, download_status)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO videos (
+            channel_name,
+            video_id,
+            title,
+            mp3_path,
+            upload_date,
+            duration_string,
+            media_type,
+            pipeline_stage
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(video_id) DO UPDATE SET
+            channel_name = excluded.channel_name,
             title = excluded.title,
             mp3_path = excluded.mp3_path,
-            download_status = excluded.download_status
+            upload_date = excluded.upload_date,
+            duration_string = excluded.duration_string,
+            media_type = excluded.media_type,
+            pipeline_stage = excluded.pipeline_stage
         """,
-        (ch, vid, title, mp3, status),
+        (
+            ch,
+            vid,
+            title,
+            mp3,
+            upload_date,
+            duration_string,
+            media_type,
+            pipeline_stage,
+        ),
     )
     conn.commit()
 
@@ -93,6 +104,9 @@ def _collect_video_ids(info: dict[str, Any]) -> list[str]:
             print(f"📂 Processing {tab_title}: found {len(sub_entries)} items")
 
             for sub_item in sub_entries:
+                # skip 'live_status': 'is_upcoming'
+                if sub_item.get("live_status") == "is_upcoming":
+                    continue
                 if sub_item and "id" in sub_item:
                     video_ids.append(sub_item["id"])
         elif "id" in entry:
@@ -144,8 +158,9 @@ def sync_channel(channel_url: str) -> None:
         raise RuntimeError("No video ids found; try a /videos URL or check the channel response.")
 
     try:
-        for i, vid in enumerate(iter_with_progress(video_ids, desc="Downloading")):
-            if video_exists(conn, vid):
+        for i, vid in enumerate(iter_with_progress(video_ids, desc="Downloading", unit="video")):
+            already_exists = conn.execute("SELECT 1 FROM videos WHERE video_id = ?", (vid,)).fetchone() is not None
+            if already_exists:
                 print(f"Skipping [{vid}]")
                 continue
 
@@ -153,13 +168,13 @@ def sync_channel(channel_url: str) -> None:
             download_audio(watch_url, conn=conn)
 
             rest = video_ids[i + 1 :]
-            if any(not video_exists(conn, x) for x in rest):
+            if any(conn.execute("SELECT 1 FROM videos WHERE video_id = ?", (x,)).fetchone() is None for x in rest):
                 time.sleep(random.uniform(2, 5))
     finally:
         conn.close()
 
 
-def download_audio(youtube_url: str, conn: sqlite3.Connection | None = None) -> tuple[Path, str]:
+def download_audio(youtube_url: str, conn: sqlite3.Connection | None = None) -> tuple[Path | None, str]:
     """Download the best available audio and extract it as MP3 under ``AUDIO_DIR``."""
     config.check_config()
 
@@ -236,6 +251,9 @@ def download_audio(youtube_url: str, conn: sqlite3.Connection | None = None) -> 
             "title": info.get("title", "Unknown Title"),
             "local_path": mp3_path.resolve(),
             "channel_name": channel_name,
+            "upload_date": info.get("upload_date"),
+            "duration_string": info.get("duration_string"),
+            "media_type": info.get("media_type"),
         }
         add_video_to_registry(active_conn, metadata)
 

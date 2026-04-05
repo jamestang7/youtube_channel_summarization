@@ -1,13 +1,11 @@
 # youtube-channel-summarization
 
-Local pipeline: **download YouTube audio** (yt-dlp, with optional cookies) → **transcribe** with **faster-whisper** → **chunk + embed** with **LangChain** + **sentence-transformers** → **ChromaDB** for retrieval.
+Local pipeline: **download YouTube audio** (yt-dlp, with optional cookies) → **transcribe** with **faster-whisper** → **clean / summarize** transcripts → **embed into ChromaDB** for retrieval.
 
 ## Setup (Windows + NVIDIA)
 
 1. **Python 3.12+** recommended.
-
-2. Install **PyTorch with CUDA** from [pytorch.org](https://pytorch.org/get-started/locally/) so `faster-whisper` and embeddings can use the GPU (8GB-class cards: prefer `distil-small.en` / `small` and `int8_float16`).
-
+2. Install **PyTorch with CUDA** from [pytorch.org](https://pytorch.org/get-started/locally/) so `faster-whisper` and embeddings can use the GPU.
 3. Install the project:
 
 ```bash
@@ -20,53 +18,86 @@ Or use pinned production dependencies only:
 python -m pip install -r requirements.txt
 ```
 
-4. **FFmpeg**: the repo depends on `static-ffmpeg`, which tries to ship a binary. If audio extraction still fails, install FFmpeg and ensure `ffmpeg` is on `PATH`.
+4. Ensure your local requirements are ready:
+   - valid `.env`
+   - `HF_TOKEN`
+   - `cookies.firefox-private.txt`
+   - FFmpeg binaries in the configured folder
+   - Ollama running locally if you use summarize
 
-## CLI
+## Golden Path CLI
 
-```bash
-python -m youtube_rag.main --url "https://www.youtube.com/watch?v=VIDEO_ID" --language en
-```
-
-Installed entry point (after editable install):
-
-```bash
-youtube-rag --url "https://www.youtube.com/watch?v=VIDEO_ID"
-```
-
-### Members-only / subscriber content
-
-Use a **Netscape cookie file** or **browser cookies** (same semantics as yt-dlp):
+### 1. First-time initialization
 
 ```bash
-python -m youtube_rag.main --url "..." --cookies-from-browser chrome
-python -m youtube_rag.main --url "..." --cookies-file "C:\Users\you\cookies-youtube-com.txt"
+uv run python -m youtube_rag.main update --channel-url "https://www.youtube.com/@zrzjpl"
 ```
 
-Do **not** commit cookie files. Refresh cookies if you see HTTP 403 / sign-in errors.
+This command:
+- discovers channel videos
+- downloads only missing videos
+- transcribes pending videos
+- preprocesses pending transcripts
+- summarizes pending cleaned transcripts
+- indexes pending items into the local knowledge base
 
-### Live streams
+### 2. Future channel updates
+
+Use the same command again whenever the channel uploads a new video:
 
 ```bash
-python -m youtube_rag.main --url "..." --live-from-start
-python -m youtube_rag.main --url "..." --wait-for-video 15
+uv run python -m youtube_rag.main update --channel-url "https://www.youtube.com/@zrzjpl"
 ```
 
-## Layout
+### 3. Ask the local knowledge base
 
-- `src/youtube_rag/youtube_ingest.py` — yt-dlp wrapper, typed errors, cookie + live flags.
-- `src/youtube_rag/transcriber.py` — faster-whisper segmentation.
-- `src/youtube_rag/vector_db.py` — chunking w/ timestamps, Chroma ingest.
-- `src/youtube_rag/main.py` — argparse orchestrator.
+```bash
+uv run python -m youtube_rag.main ask --query "鲁社长怎么看薄熙来？"
+```
 
-Artifacts:
+### 4. Optionally add one video directly
 
-- Audio: `downloads/` by default.
-- Vectors: `chroma_data/` default persistence directory.
+```bash
+uv run python -m youtube_rag.main add --video-url "https://www.youtube.com/watch?v=VIDEO_ID"
+```
+
+## Advanced / internal commands
+
+These remain available for debugging or manual recovery, but they are not the recommended normal workflow:
+
+```bash
+uv run python -m youtube_rag.main ingest --channel-url "..."
+uv run python -m youtube_rag.main transcribe
+uv run python -m youtube_rag.main preprocess
+uv run python -m youtube_rag.main summarize
+uv run python -m youtube_rag.main index --pending-only
+```
 
 ## Development
 
 ```bash
 python -m pytest
 ```
- yt-dlp "https://www.youtube.com/watch?v=rd-oTL3PlKc&t=822s" --cookies .\cookies.firefox-private.txt --extractor-args "youtube:player-client=mweb" --js-runtimes node --extract-audio --audio-format mp3 --remote-components ejs:github --ffmpeg-location .\ffmpeg-2026-03-26-git-fd9f1e9c52-essentials_build\bin\
+
+## Running locally
+
+Terminal 1 — Python API server:
+
+```bash
+uvicorn api:app --port 8000 --reload
+```
+
+Terminal 2 — Next.js frontend:
+
+```bash
+cd web && npm run dev
+```
+
+Then open http://localhost:3000
+The search bar will now call the Python RAG backend.
+
+To verify the API is running:
+
+```bash
+curl http://127.0.0.1:8000/health
+```

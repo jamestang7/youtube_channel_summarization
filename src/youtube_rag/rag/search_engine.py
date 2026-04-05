@@ -8,7 +8,7 @@ from typing import Any
 
 from ..core import config
 from ..core.models import AnswerResult, RetrievedSource, build_context_block
-from .llm_client import LLMChatClient
+from .llm_client import active_model, llm_generate
 
 _G_MIN_SCORE: float | None = None
 DEFAULT_COLLECTION_NAME = "youtube_transcript_chunks"
@@ -26,23 +26,6 @@ ANSWER_SYSTEM_PROMPT = (
     "允许使用拟人口吻，但不要假装你本人就是鲁社长，不要编造个人经历。\n"
     "输出必须结构化，便于读者快速理解。"
 )
-
-
-def get_collection(collection_name: str = DEFAULT_COLLECTION_NAME) -> Any:
-    from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
-    import chromadb
-
-    chroma_path = Path(config.CHROMA_DB_DIR)
-    chroma_path.mkdir(parents=True, exist_ok=True)
-
-    client = chromadb.PersistentClient(path=str(chroma_path))
-    embedding_fn = SentenceTransformerEmbeddingFunction(model_name=config.LOCAL_EMBEDDING_MODEL)
-
-    return client.get_or_create_collection(
-        name=collection_name,
-        embedding_function=embedding_fn,
-        metadata={"hnsw:space": "cosine"},
-    )
 
 
 def retrieve_sources(
@@ -121,18 +104,35 @@ def build_user_prompt(query: str, context_block: str) -> str:
 
 
 def ask_question(query: str, top_k: int = 5) -> dict[str, object]:
-    collection = get_collection()
+    from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+    import chromadb
+
+    chroma_path = Path(config.CHROMA_DB_DIR)
+    chroma_path.mkdir(parents=True, exist_ok=True)
+
+    client = chromadb.PersistentClient(path=str(chroma_path))
+    embedding_fn = SentenceTransformerEmbeddingFunction(model_name=config.LOCAL_EMBEDDING_MODEL)
+    collection = client.get_or_create_collection(
+        name=DEFAULT_COLLECTION_NAME,
+        embedding_function=embedding_fn,
+        metadata={"hnsw:space": "cosine"},
+    )
+
     sources = retrieve_sources(collection=collection, query=query, top_k=top_k, min_score=_G_MIN_SCORE)
     if not sources:
         return AnswerResult(answer_text="信息不足，无法从已检索内容确定", sources=[]).to_dict()
 
     provider = config.LLM_PROVIDER.lower()
-    llm_client = LLMChatClient(provider=provider)
-    logging.info("LLM provider=%s model=%s", provider, llm_client.active_model())
+    print(f"{config.GROQ_MODEL=}")
+    import os
+    print(f"{os.environ['GROQ_API_KEY'][-10:]}")
+    print(f"{provider=}")
+    logging.info("LLM provider=%s model=%s", provider, active_model(provider))
 
-    answer_text = llm_client.generate(
-        system_prompt=ANSWER_SYSTEM_PROMPT,
-        user_prompt=build_user_prompt(query=query, context_block=build_context_block(sources)),
+    answer_text = llm_generate(
+        provider=provider,
+        system=ANSWER_SYSTEM_PROMPT,
+        user=build_user_prompt(query=query, context_block=build_context_block(sources)),
         temperature=0.2,
     )
     return AnswerResult(answer_text=answer_text, sources=sources).to_dict()

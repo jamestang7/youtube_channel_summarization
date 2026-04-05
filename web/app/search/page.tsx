@@ -3,6 +3,7 @@
 import { Suspense } from "react";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
+import ReactMarkdown from "react-markdown";
 
 type Source = {
   video_id: string;
@@ -29,17 +30,11 @@ function fmt(sec: number): string {
 }
 
 function injectCitationLinks(answer: string, sources: Source[]): string {
-  const escaped = answer
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/\n/g, "<br />");
-
-  return escaped.replace(/\[Source\s+(\d+)\]/g, (_, p1) => {
+  return answer.replace(/\[Source\s+(\d+)\]/g, (_, p1) => {
     const idx = Number(p1) - 1;
     const src = sources[idx];
     if (!src?.timestamp_url) return `[Source ${p1}]`;
-    return `<a href="${src.timestamp_url}" target="_blank" rel="noreferrer">[Source ${p1}]</a>`;
+    return `[[Source ${p1}]](${src.timestamp_url})`;
   });
 }
 
@@ -121,7 +116,15 @@ function SearchPageContent() {
         <>
           <section className="panel">
             <h2 style={{ marginTop: 0 }}>回答</h2>
-            <div className="muted" dangerouslySetInnerHTML={{ __html: renderedAnswer }} />
+            <div className="answer-markdown">
+              <ReactMarkdown
+                components={{
+                  a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noreferrer" />,
+                }}
+              >
+                {renderedAnswer}
+              </ReactMarkdown>
+            </div>
           </section>
 
           <section className="panel" style={{ display: "grid", gap: 10 }}>

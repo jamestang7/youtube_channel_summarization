@@ -7,60 +7,13 @@ from pathlib import Path
 from typing import Any
 
 from ..core import config
+from ..core.database import advance_stage, get_connection, mark_error
 from .chunking import build_chunks_from_segments
 
 DEFAULT_COLLECTION_NAME = "youtube_transcript_chunks"
 
 
-def load_docs(source: str, video_id: str | None = None) -> tuple[list[dict[str, Any]], int, int]:
-    if source == "transcripts":
-        base_dir = Path(config.TRANSCRIPTS_DIR)
-        pattern = "*.json"
-    else:
-        base_dir = Path(config.PROCESSED_DIR)
-        pattern = "*.cleaned.json"
-
-    if video_id:
-        candidate = base_dir / (f"{video_id}.json" if source == "transcripts" else f"{video_id}.cleaned.json")
-        file_paths = [candidate] if candidate.exists() else []
-    else:
-        file_paths = sorted(base_dir.glob(pattern))
-
-    docs: list[dict[str, Any]] = []
-    skipped = 0
-    failed = 0
-
-    for path in file_paths:
-        try:
-            with path.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-
-            segments = data.get("segments")
-            if not isinstance(segments, list) or not segments:
-                logging.warning("[SKIP] %s has no valid segments", path.name)
-                skipped += 1
-                continue
-
-            docs.append(
-                {
-                    "video_id": data.get("video_id") or path.stem.replace(".cleaned", ""),
-                    "title": data.get("title") or "",
-                    "youtube_url": data.get("youtube_url") or "",
-                    "segments": segments,
-                    "source_file": str(path),
-                }
-            )
-        except json.JSONDecodeError:
-            logging.exception("[FAIL] Invalid JSON: %s", path.name)
-            failed += 1
-        except Exception:
-            logging.exception("[FAIL] Could not load %s", path.name)
-            failed += 1
-
-    return docs, skipped, failed
-
-
-def get_or_create_collection(rebuild: bool = False, collection_name: str = DEFAULT_COLLECTION_NAME) -> Any:
+def get_chroma_collection(*, rebuild: bool = False, collection_name: str = DEFAULT_COLLECTION_NAME) -> Any:
     from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
     import chromadb
 
@@ -77,7 +30,6 @@ def get_or_create_collection(rebuild: bool = False, collection_name: str = DEFAU
             pass
 
     embedding_fn = SentenceTransformerEmbeddingFunction(model_name=config.LOCAL_EMBEDDING_MODEL)
-
     return client.get_or_create_collection(
         name=collection_name,
         embedding_function=embedding_fn,
@@ -85,82 +37,157 @@ def get_or_create_collection(rebuild: bool = False, collection_name: str = DEFAU
     )
 
 
-def upsert_chunks(collection: Any, doc: dict[str, Any], chunks: list[dict[str, Any]]) -> int:
-    if not chunks:
-        return 0
+def load_doc(path: Path) -> dict[str, Any] | None:
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError:
+        logging.exception("[FAIL] Invalid JSON: %s", path.name)
+        return None
+    except Exception:
+        logging.exception("[FAIL] Could not load %s", path.name)
+        return None
 
-    ids: list[str] = []
-    documents: list[str] = []
-    metadatas: list[dict[str, Any]] = []
+    segments = data.get("segments")
+    if not isinstance(segments, list) or not segments:
+        logging.warning("[SKIP] %s has no valid segments", path.name)
+        return None
 
-    for chunk_index, chunk in enumerate(chunks):
-        start_sec = round(float(chunk["start_sec"]), 3)
-        end_sec = round(float(chunk["end_sec"]), 3)
-        chunk_id = f"{doc['video_id']}:{chunk_index}:{start_sec}:{end_sec}"
+    return {
+        "video_id": data.get("video_id") or path.stem.replace(".cleaned", ""),
+        "title": data.get("title") or "",
+        "youtube_url": data.get("youtube_url") or "",
+        "segments": segments,
+        "source_file": str(path),
+    }
 
-        ids.append(chunk_id)
-        documents.append(chunk["chunk_text"])
-        metadatas.append(
-            {
-                "video_id": str(doc["video_id"]),
-                "title": str(doc.get("title", "")),
-                "youtube_url": str(doc.get("youtube_url", "")),
-                "start_sec": start_sec,
-                "end_sec": end_sec,
-                "source_file": str(doc["source_file"]),
-                "chunk_index": chunk_index,
-            }
-        )
 
-    collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
-    return len(ids)
+def collect_pending_docs(video_id: str | None = None, limit: int | None = None) -> tuple[list[dict[str, Any]], int, int]:
+    query = [
+        "SELECT video_id, cleaned_path FROM videos",
+        "WHERE pipeline_stage = ?",
+    ]
+    params: list[object] = ["summarized"]
+
+    if video_id:
+        query.append("AND video_id = ?")
+        params.append(video_id)
+
+    query.append("ORDER BY download_date")
+    if limit is not None:
+        query.append("LIMIT ?")
+        params.append(limit)
+
+    with get_connection() as db:
+        rows = db.execute(" ".join(query), params).fetchall()
+
+    docs: list[dict[str, Any]] = []
+    skipped = 0
+    failed = 0
+    for row_video_id, cleaned_path in rows:
+        if not cleaned_path:
+            skipped += 1
+            continue
+
+        doc = load_doc(Path(cleaned_path))
+        if doc is None:
+            failed += 1
+            continue
+
+        if str(doc["video_id"]) != str(row_video_id):
+            doc["video_id"] = str(row_video_id)
+        docs.append(doc)
+
+    return docs, skipped, failed
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build Chroma index from transcript JSON files")
-    parser.add_argument("--source", choices=["transcripts", "processed"], default="transcripts")
+    parser = argparse.ArgumentParser(description="Build Chroma index from cleaned transcript JSON files")
     parser.add_argument("--video-id", type=str, default=None)
     parser.add_argument("--rebuild", action="store_true")
     parser.add_argument("--max-chars-per-chunk", type=int, default=800)
     parser.add_argument("--overlap-segments", type=int, default=1)
+    parser.add_argument("--limit", type=int, default=None)
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
+def run_pending(
+    video_id: str | None = None,
+    rebuild: bool = False,
+    max_chars_per_chunk: int = 800,
+    overlap_segments: int = 1,
+    limit: int | None = None,
+) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
-    docs, skipped_files, failed_files = load_docs(source=args.source, video_id=args.video_id)
+    docs, skipped_files, failed_files = collect_pending_docs(video_id=video_id, limit=limit)
     if not docs:
-        logging.info("No files to index from source=%s", args.source)
+        logging.info("No summarized videos pending indexing.")
         return
 
-    collection = get_or_create_collection(rebuild=args.rebuild)
+    collection = get_chroma_collection(rebuild=rebuild)
 
-    processed_files = 0
-    total_chunks = 0
+    all_ids: list[str] = []
+    all_docs: list[str] = []
+    all_metas: list[dict[str, Any]] = []
+    processed_video_ids: list[str] = []
+    failed_video_ids: list[str] = []
 
     for doc in docs:
         try:
             chunks = build_chunks_from_segments(
                 segments=doc["segments"],
-                max_chars_per_chunk=args.max_chars_per_chunk,
-                overlap_segments=args.overlap_segments,
+                max_chars_per_chunk=max_chars_per_chunk,
+                overlap_segments=overlap_segments,
             )
-            chunk_count = upsert_chunks(collection=collection, doc=doc, chunks=chunks)
-            total_chunks += chunk_count
-            processed_files += 1
-            logging.info("[OK] %s indexed with %s chunks", doc["video_id"], chunk_count)
+            for i, chunk in enumerate(chunks):
+                start_sec = round(float(chunk["start_sec"]), 3)
+                end_sec = round(float(chunk["end_sec"]), 3)
+                all_ids.append(f"{doc['video_id']}:{i}:{start_sec}:{end_sec}")
+                all_docs.append(chunk["chunk_text"])
+                all_metas.append(
+                    {
+                        "video_id": str(doc["video_id"]),
+                        "title": str(doc.get("title", "")),
+                        "youtube_url": str(doc.get("youtube_url", "")),
+                        "start_sec": start_sec,
+                        "end_sec": end_sec,
+                        "source_file": str(doc["source_file"]),
+                        "chunk_index": i,
+                    }
+                )
+            processed_video_ids.append(doc["video_id"])
         except Exception:
-            failed_files += 1
-            logging.exception("[FAIL] Could not index %s", doc.get("video_id", "unknown"))
+            failed_video_ids.append(doc["video_id"])
+            logging.exception("[FAIL] building chunks for %s", doc.get("video_id"))
+
+    if all_ids:
+        collection.upsert(ids=all_ids, documents=all_docs, metadatas=all_metas)
+        logging.info("Upserted %d chunks across %d videos", len(all_ids), len(processed_video_ids))
+
+    with get_connection() as conn:
+        for vid in processed_video_ids:
+            advance_stage(conn, vid, "indexed")
+        for vid in failed_video_ids:
+            mark_error(conn, vid)
 
     logging.info(
         "Indexing done | files_processed=%s | total_chunks=%s | skipped_files=%s | failed_files=%s",
-        processed_files,
-        total_chunks,
+        len(processed_video_ids),
+        len(all_ids),
         skipped_files,
-        failed_files,
+        failed_files + len(failed_video_ids),
+    )
+
+
+def main() -> None:
+    args = parse_args()
+    run_pending(
+        video_id=args.video_id,
+        rebuild=args.rebuild,
+        max_chars_per_chunk=args.max_chars_per_chunk,
+        overlap_segments=args.overlap_segments,
+        limit=args.limit,
     )
 
 

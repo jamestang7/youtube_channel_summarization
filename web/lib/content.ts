@@ -1,14 +1,30 @@
+import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { promisify } from "node:util";
 
 import { readEvents } from "./events";
 import type { OutlineSegment, RankedVideo, UsageEvent, VideoOutline } from "./types";
 
+const execFileAsync = promisify(execFile);
 const PROCESSED_DIR = path.join(process.cwd(), "..", "data", "processed");
+const DB_FILE = path.join(process.cwd(), "..", "data", "project.db");
 const RECENT_DAYS = 14;
 
 function toIsoDate(d: Date): string {
   return d.toISOString().slice(0, 10);
+}
+
+function normalizeUploadDate(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const raw = value.trim();
+  if (!raw) return null;
+  if (/^\d{8}$/.test(raw)) {
+    return `${raw.slice(0, 4)}-${raw.slice(4, 6)}-${raw.slice(6, 8)}`;
+  }
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return toIsoDate(parsed);
 }
 
 function deriveSummary(fullText: string): string {
@@ -30,10 +46,36 @@ async function readProcessedFiles(): Promise<string[]> {
   return entries.filter((f) => f.endsWith(".cleaned.json"));
 }
 
-async function readOutline(videoId: string): Promise<VideoOutline | null> {
+async function readUploadDates(): Promise<Map<string, string>> {
+  const script = [
+    "import json, sqlite3, sys",
+    "conn = sqlite3.connect(sys.argv[1])",
+    "rows = conn.execute('SELECT video_id, upload_date FROM videos').fetchall()",
+    "conn.close()",
+    "print(json.dumps(rows, ensure_ascii=False))",
+  ].join("; ");
+
   try {
-    const raw = await fs.readFile(path.join(PROCESSED_DIR, `${videoId}.cleaned.json`), "utf-8");
-    const stat = await fs.stat(path.join(PROCESSED_DIR, `${videoId}.cleaned.json`));
+    const { stdout } = await execFileAsync("python", ["-c", script, DB_FILE], {
+      cwd: process.cwd(),
+      windowsHide: true,
+    });
+    const rows = JSON.parse(stdout) as Array<[string, string | null]>;
+    const uploadDates = new Map<string, string>();
+    for (const [videoId, uploadDate] of rows) {
+      const normalized = normalizeUploadDate(uploadDate);
+      if (normalized) uploadDates.set(videoId, normalized);
+    }
+    return uploadDates;
+  } catch {
+    return new Map<string, string>();
+  }
+}
+
+async function readOutline(videoId: string, uploadDates: Map<string, string>): Promise<VideoOutline | null> {
+  try {
+    const filePath = path.join(PROCESSED_DIR, `${videoId}.cleaned.json`);
+    const [raw, stat] = await Promise.all([fs.readFile(filePath, "utf-8"), fs.stat(filePath)]);
     const data = JSON.parse(raw) as {
       video_id: string;
       title: string;
@@ -54,6 +96,7 @@ async function readOutline(videoId: string): Promise<VideoOutline | null> {
 
     const durationSec = (data.segments?.[data.segments.length - 1]?.end as number | undefined) ?? 0;
     const summary = deriveSummary(data.cleaned_full_text ?? "");
+    const uploadDate = uploadDates.get(data.video_id) ?? toIsoDate(stat.mtime);
 
     return {
       videoId: data.video_id,
@@ -62,9 +105,9 @@ async function readOutline(videoId: string): Promise<VideoOutline | null> {
       thumbnail: `https://i.ytimg.com/vi/${data.video_id}/hqdefault.jpg`,
       summary,
       meta: {
-        date: toIsoDate(stat.mtime),
+        date: uploadDate,
         type: "深度解读",
-        status: "可检索",
+        status: uploadDates.has(data.video_id) ? "可检索" : "可检索 · 日期回退",
         durationSec,
       },
       segments,
@@ -99,7 +142,7 @@ export async function getHomepageSignals(): Promise<{
   hotTopics: Array<{ videoId: string; title: string; score: number }>;
   topVideos: RankedVideo[];
 }> {
-  const [events, files] = await Promise.all([readEvents(), readProcessedFiles()]);
+  const [events, files, uploadDates] = await Promise.all([readEvents(), readProcessedFiles(), readUploadDates()]);
 
   const queryCount = new Map<string, number>();
   for (const e of events) {
@@ -109,7 +152,9 @@ export async function getHomepageSignals(): Promise<{
     }
   }
 
-  const outlines = await Promise.all(files.slice(0, 80).map((f) => readOutline(f.replace(".cleaned.json", ""))));
+  const outlines = await Promise.all(
+    files.slice(0, 80).map((f) => readOutline(f.replace(".cleaned.json", ""), uploadDates)),
+  );
   const validOutlines = outlines.filter(Boolean) as VideoOutline[];
 
   const rankedRows = validOutlines.map((o) => ({
@@ -136,7 +181,7 @@ export async function getHomepageSignals(): Promise<{
     .slice(0, 6)
     .map(([q]) => q);
 
-  // `date` is ISO date from processed `.cleaned.json` mtime (readOutline), not necessarily YouTube upload time.
+  // Recency here is YouTube upload_date from the DB, not processed file mtime.
   const topVideos = [...rankedRows].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 4);
 
   return {
@@ -147,7 +192,8 @@ export async function getHomepageSignals(): Promise<{
 }
 
 export async function getVideoOutline(videoId: string): Promise<VideoOutline | null> {
-  return readOutline(videoId);
+  const uploadDates = await readUploadDates();
+  return readOutline(videoId, uploadDates);
 }
 
 function hms(sec: number): string {

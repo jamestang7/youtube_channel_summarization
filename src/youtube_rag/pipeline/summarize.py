@@ -7,17 +7,11 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Iterator, TypeVar
 
 from youtube_rag.core import config
-from youtube_rag.rag.llm_client import LLMChatClient
-
-try:
-    from tqdm import tqdm
-except Exception:  # pragma: no cover - optional dependency
-    tqdm = None
-
-T = TypeVar("T")
+from youtube_rag.core.database import advance_stage, get_connection, mark_error
+from youtube_rag.core.utils import iter_with_progress
+from youtube_rag.rag.llm_client import llm_generate
 
 SUMMARY_SYSTEM_PROMPT = (
     "你是一位专业的视频内容编辑。我会给你提供一段视频的字幕片段（含时间戳），"
@@ -41,7 +35,7 @@ def group_segments(segments: list[dict], target_groups: int = 8) -> list[list[di
     return [segments[i : i + size] for i in range(0, len(segments), size)]
 
 
-def summarize_group(client: LLMChatClient, group: list[dict], video_title: str) -> dict:
+def summarize_group(provider: str, group: list[dict], video_title: str) -> dict:
     text = "".join(s.get("text", "") for s in group)
     start = group[0].get("start", 0)
     end = group[-1].get("end", start)
@@ -50,7 +44,7 @@ def summarize_group(client: LLMChatClient, group: list[dict], video_title: str) 
         f"时间段：{int(start // 60)}:{int(start % 60):02d} - {int(end // 60)}:{int(end % 60):02d}\n"
         f"内容：{text[:1200]}"
     )
-    raw = client.generate(system_prompt=SUMMARY_SYSTEM_PROMPT, user_prompt=user_prompt, temperature=0)
+    raw = llm_generate(provider=provider, system=SUMMARY_SYSTEM_PROMPT, user=user_prompt, temperature=0)
     try:
         clean = raw.strip().removeprefix("```json").removesuffix("```").strip()
         parsed = json.loads(clean)
@@ -69,7 +63,7 @@ def summarize_group(client: LLMChatClient, group: list[dict], video_title: str) 
         }
 
 
-def process_one(path: Path, output_dir: Path, client: LLMChatClient, force: bool) -> bool:
+def process_one(path: Path, output_dir: Path, provider: str, force: bool) -> bool:
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
 
@@ -88,15 +82,16 @@ def process_one(path: Path, output_dir: Path, client: LLMChatClient, force: bool
     groups = group_segments(segments, target_groups=min(10, max(4, len(segments) // 15)))
     section_summaries = []
     for i, group in enumerate(groups):
-        result = summarize_group(client, group, title)
+        result = summarize_group(provider, group, title)
         section_summaries.append(result)
         logging.info("[%s] segment %d/%d done", video_id, i + 1, len(groups))
         time.sleep(0.5)
 
     all_titles = "\n".join(f"- {s['title']}：{s['summary']}" for s in section_summaries)
-    overall = client.generate(
-        system_prompt=OVERALL_SYSTEM_PROMPT,
-        user_prompt=f"视频标题：{title}\n\n{all_titles}",
+    overall = llm_generate(
+        provider=provider,
+        system=OVERALL_SYSTEM_PROMPT,
+        user=f"视频标题：{title}\n\n{all_titles}",
         temperature=0,
     )
     outline = {
@@ -112,46 +107,78 @@ def process_one(path: Path, output_dir: Path, client: LLMChatClient, force: bool
     return True
 
 
-def iter_with_progress(items: list[T], desc: str) -> Iterator[T]:
-    if tqdm is not None:
-        yield from tqdm(items, desc=desc, unit="file")
-        return
-    total = len(items)
-    for idx, item in enumerate(items, start=1):
-        logging.info("%s [%d/%d]", desc, idx, total)
-        yield item
+def collect_pending_items(video_id: str | None = None, limit: int | None = None) -> list[tuple[str, Path]]:
+    query = [
+        "SELECT video_id, cleaned_path FROM videos",
+        "WHERE pipeline_stage = ?",
+    ]
+    params: list[object] = ["cleaned"]
+
+    if video_id:
+        query.append("AND video_id = ?")
+        params.append(video_id)
+
+    query.append("ORDER BY download_date")
+    if limit is not None:
+        query.append("LIMIT ?")
+        params.append(limit)
+
+    with get_connection() as db:
+        rows = db.execute(" ".join(query), params).fetchall()
+
+    return [(str(row[0]), Path(row[1])) for row in rows if row[1]]
 
 
-def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--video-id", default=None)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
-    args = parser.parse_args()
+    return parser.parse_args()
 
-    repo_processed_dir = Path.cwd() / "data" / "processed"
-    processed_dir = repo_processed_dir if repo_processed_dir.exists() else Path(config.PROCESSED_DIR)
-    output_dir = processed_dir
-    client = LLMChatClient(provider=config.PROVIDER_OLLAMA)
-    files = sorted(processed_dir.glob("*.cleaned.json"))
-    if args.video_id:
-        files = [f for f in files if args.video_id in f.name]
-    if args.limit:
-        files = files[: args.limit]
-    if not files:
-        logging.info("No cleaned transcript files found in %s", processed_dir)
+
+def run_pending(video_id: str | None = None, limit: int | None = None, force: bool = False) -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+
+    output_dir = Path(config.PROCESSED_DIR)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    items = collect_pending_items(video_id=video_id, limit=limit)
+    if not items:
+        logging.info("No cleaned transcript files pending summarization.")
         return
 
-    logging.info("Summarizing %d file(s) from %s", len(files), processed_dir)
+    provider = config.PROVIDER_OLLAMA
+    logging.info("Summarizing %d file(s) from %s", len(items), output_dir)
     success_count = 0
     fail_count = 0
-    for file_path in iter_with_progress(files, desc="Summarizing"):
-        if process_one(file_path, output_dir, client, args.force):
-            success_count += 1
-        else:
-            fail_count += 1
-    logging.info("Done. success=%d fail=%d total=%d", success_count, fail_count, len(files))
+
+    for current_video_id, file_path in iter_with_progress(items, desc="Summarizing", unit="file"):
+        outline_path = output_dir / f"{current_video_id}.outline.json"
+        try:
+            ok = process_one(file_path, output_dir, provider, force)
+        except Exception:
+            ok = False
+            logging.exception("[FAIL] %s unexpected summarize failure", current_video_id)
+
+        with get_connection() as db:
+            if ok:
+                db.execute(
+                    "UPDATE videos SET outline_path = ? WHERE video_id = ?",
+                    (str(outline_path.resolve()), current_video_id),
+                )
+                advance_stage(db, current_video_id, "summarized")
+                success_count += 1
+            else:
+                mark_error(db, current_video_id)
+                fail_count += 1
+
+    logging.info("Done. success=%d fail=%d total=%d", success_count, fail_count, len(items))
+
+
+def main() -> None:
+    args = parse_args()
+    run_pending(video_id=args.video_id, limit=args.limit, force=args.force)
 
 
 if __name__ == "__main__":
