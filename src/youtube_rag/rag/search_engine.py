@@ -123,10 +123,6 @@ def ask_question(query: str, top_k: int = 5) -> dict[str, object]:
         return AnswerResult(answer_text="信息不足，无法从已检索内容确定", sources=[]).to_dict()
 
     provider = config.LLM_PROVIDER.lower()
-    print(f"{config.GROQ_MODEL=}")
-    import os
-    print(f"{os.environ['GROQ_API_KEY'][-10:]}")
-    print(f"{provider=}")
     logging.info("LLM provider=%s model=%s", provider, active_model(provider))
 
     answer_text = llm_generate(

@@ -8,6 +8,7 @@ from youtube_rag.pipeline.ingest import sync_channel, download_audio
 from youtube_rag.pipeline.transcribe import transcribe_videos
 from youtube_rag.pipeline.preprocess import run_pending as clean_pending
 from youtube_rag.pipeline.summarize import run_pending as summarize_pending
+from youtube_rag.pipeline.knowledge import build_knowledge_base
 from youtube_rag.rag.indexer import run_pending as index_pending
 from youtube_rag.rag.search_engine import ask_question
 
@@ -30,7 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command")
 
     p = sub.add_parser("update", help="Sync channel and process all pending stages")
-    p.add_argument("--channel-url", help="Youtube channel url",required=True)
+    p.add_argument("--channel-url", help="Youtube channel url. Defualt is https://www.youtube.com/@zrzjpl.", default="https://www.youtube.com/@zrzjpl")
     p.add_argument("--watch", action="store_true", help="Re-run every --interval seconds")
     p.add_argument("--interval", type=int, default=3600)
 
@@ -40,6 +41,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("ask", help="Query the knowledge base")
     p.add_argument("--query", required=True)
     p.add_argument("--top-k", type=int, default=5)
+
+    sub.add_parser("knowledge", help="Generate Obsidian-style knowledge notes and graph artifacts")
 
     return parser
 
@@ -66,6 +69,9 @@ def main() -> None:
 
     elif args.command == "ask":
         print(json.dumps(ask_question(args.query, top_k=args.top_k), ensure_ascii=False, indent=2))
+
+    elif args.command == "knowledge":
+        print(json.dumps(build_knowledge_base(), ensure_ascii=False, indent=2))
 
     else:
         build_parser().print_help()

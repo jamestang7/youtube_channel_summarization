@@ -14,18 +14,21 @@ LOCAL_EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
 PROVIDER_OPENAI = "openai"
 PROVIDER_GROQ = "groq"
 PROVIDER_OLLAMA = "ollama"
+PROVIDER_GEMINI = "gemini"
 
 # LLM settings
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.4-mini")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-LLM_CLEANER = os.getenv("LLM_CLEANER", PROVIDER_OPENAI).lower()     # for cleaning the transcripts
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", PROVIDER_GROQ).lower()   # for answering the questions
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+LLM_CLEANER = os.getenv("LLM_CLEANER", PROVIDER_OPENAI).lower()
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", PROVIDER_GEMINI).lower()
 
 # HTTP base URLs
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+GEMINI_BASE_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
 
 BASE_DIR = Path(__file__).resolve().parents[3]
 COOKIE_FILE = BASE_DIR / "cookies.firefox-private.txt"
@@ -35,6 +38,7 @@ DB_FILE = DATA_DIR / "project.db"
 AUDIO_DIR = DATA_DIR / "audio"
 TRANSCRIPTS_DIR = DATA_DIR / "transcripts"
 PROCESSED_DIR = DATA_DIR / "processed"
+KNOWLEDGE_DIR = DATA_DIR / "knowledge"
 ENV_FILE = BASE_DIR / ".env"
 CHROMA_DB_DIR = DATA_DIR / "chroma_db"
 

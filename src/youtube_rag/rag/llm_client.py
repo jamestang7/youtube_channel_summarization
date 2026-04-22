@@ -13,23 +13,35 @@ def active_model(provider: str) -> str:
         return config.GROQ_MODEL
     if provider == config.PROVIDER_OLLAMA:
         return config.OLLAMA_MODEL
+    if provider == config.PROVIDER_GEMINI:
+        return config.GEMINI_MODEL
     raise RuntimeError(f"Unknown provider: {provider}")
 
 
 def llm_generate(provider: str, system: str, user: str, temperature: float = 0.2) -> str:
     provider = provider.lower()
-    if provider in (config.PROVIDER_OPENAI, config.PROVIDER_GROQ):
-        return _openai_compat(provider, system, user, temperature)
     if provider == config.PROVIDER_OLLAMA:
         return _ollama(system, user)
+    if provider in (config.PROVIDER_OPENAI, config.PROVIDER_GROQ, config.PROVIDER_GEMINI):
+        return _openai_compat(provider, system, user, temperature)
     raise RuntimeError(f"Unknown provider: {provider}")
 
 
 def _openai_compat(provider: str, system: str, user: str, temperature: float) -> str:
-    api_key = os.getenv("OPENAI_API_KEY" if provider == config.PROVIDER_OPENAI else "GROQ_API_KEY")
+    key_map = {
+        config.PROVIDER_OPENAI: "OPENAI_API_KEY",
+        config.PROVIDER_GROQ: "GROQ_API_KEY",
+        config.PROVIDER_GEMINI: "GEMINI_API_KEY",
+    }
+    url_map = {
+        config.PROVIDER_OPENAI: config.OPENAI_BASE_URL,
+        config.PROVIDER_GROQ: config.GROQ_BASE_URL,
+        config.PROVIDER_GEMINI: config.GEMINI_BASE_URL,
+    }
+    api_key = os.getenv(key_map[provider])
     if not api_key:
         raise RuntimeError(f"[{provider}] API key missing")
-    base_url = config.OPENAI_BASE_URL if provider == config.PROVIDER_OPENAI else config.GROQ_BASE_URL
+    base_url = url_map[provider]
     data = post_json_with_retry(
         url=f"{base_url.rstrip('/')}/chat/completions",
         payload={
@@ -40,7 +52,7 @@ def _openai_compat(provider: str, system: str, user: str, temperature: float) ->
                 {"role": "user", "content": user},
             ],
         },
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "User-Agent": "youtube-rag/0.1 (+local dev)",},
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "User-Agent": "youtube-rag/0.1 (+local dev)"},
         provider=provider,
     )
     return data["choices"][0]["message"]["content"].strip()
